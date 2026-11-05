@@ -1212,6 +1212,23 @@ def create_bot_application() -> Application:
     # Inline Keyboard Callbacks
     app.add_handler(CallbackQueryHandler(handle_callback_query))
 
+    import telegram.error
+
+    async def bot_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handles exceptions and logs conflicts cleanly without crashing."""
+        if isinstance(context.error, telegram.error.Conflict):
+            logger.warning(
+                "Telegram polling conflict: Another bot instance is polling with this token. "
+                "Backing off for 15s to avoid duplicate request collisions..."
+            )
+            await asyncio.sleep(15)
+        elif isinstance(context.error, (telegram.error.NetworkError, telegram.error.TimedOut)):
+            logger.warning(f"Telegram network issue: {context.error}. Reconnecting...")
+        else:
+            logger.error(f"Telegram bot exception encountered: {context.error}", exc_info=context.error)
+
+    app.add_error_handler(bot_error_handler)
+
     return app
 
 
