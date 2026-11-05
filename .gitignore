@@ -1,0 +1,48 @@
+# Environment & Credentials (CRITICAL: NEVER COMMIT SECRETS)
+.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+direct_checkout_accounts.json
+
+# Dependencies
+node_modules
+.venv
+venv
+
+# Production Builds & Temporary Output
+dist
+dist-ssr
+scratch
+exports
+.temp
+supabase/.temp
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Python & Testing Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor & OS files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

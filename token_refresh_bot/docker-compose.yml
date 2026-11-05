@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  token-refresh-bot:
+    build: .
+    container_name: meesho-account-token-refresh-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./exports:/app/exports
+      - ./scratch:/app/scratch

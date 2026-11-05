@@ -1,0 +1,15 @@
+node_modules
+dist
+scratch
+.git
+.agents
+.venv
+venv
+__pycache__
+*.pyc
+*.session
+*.session-journal
+*.log
+.DS_Store
+.idea
+.vscode
