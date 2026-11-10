@@ -1,9 +1,8 @@
 """
-Unit & Integration Tests for Automatic Delivery of Refreshed Files to User.
+Unit & Integration Tests for In-Bot Refresh Completion Reporting.
 Tests:
-- Automatic delivery of single refreshed account JSON file to user chat
-- Automatic delivery of multiple separate refreshed account JSON files (NO ZIP!) and combined file
-- Automatic delivery of failure report if any account fails
+- Refresh completion summary is sent to user chat upon batch completion
+- All refreshed sessions are updated in database without auto-exporting files to chat
 - Verification that QueueManager completion hook triggers upon batch completion
 """
 
@@ -28,8 +27,8 @@ import bot
 
 
 @pytest.mark.asyncio
-async def test_automatic_delivery_single_account():
-    """Validates that a single refreshed account is delivered directly as a JSON file."""
+async def test_completion_summary_single_account_no_chat_export():
+    """Validates that a single refreshed account updates in DB and sends summary message without sending files."""
     await BotStorage.init_db()
 
     batch_id = f"test_auto_delivery_single_{uuid.uuid4().hex[:8]}"
@@ -71,18 +70,15 @@ async def test_automatic_delivery_single_account():
     msg_args = mock_bot.send_message.call_args[1]
     assert msg_args["chat_id"] == user_id
     assert "Token Refresh Completed" in msg_args["text"]
+    assert "saved directly inside bot database" in msg_args["text"]
 
-    # Verify document sent
-    assert mock_bot.send_document.called
-    doc_args = mock_bot.send_document.call_args[1]
-    assert doc_args["chat_id"] == user_id
-    assert "9033807401" in doc_args["document"].filename
-    assert "Refreshed Account JSON File" in doc_args["caption"]
+    # Verify NO documents are sent to chat (strictly in-bot refresh, no file spam)
+    assert not mock_bot.send_document.called
 
 
 @pytest.mark.asyncio
-async def test_automatic_delivery_multiple_accounts_no_zip():
-    """Validates that multiple refreshed accounts are delivered individually without zip archives."""
+async def test_completion_summary_multiple_accounts_no_chat_export():
+    """Validates that multiple refreshed accounts update in DB with zero file exports to chat."""
     await BotStorage.init_db()
 
     batch_id = f"test_auto_delivery_multi_{uuid.uuid4().hex[:8]}"
@@ -137,14 +133,15 @@ async def test_automatic_delivery_multiple_accounts_no_zip():
 
     await bot.deliver_refreshed_batch_results(batch_id)
 
-    # 2 individual files + 1 combined file = 3 document sends
-    assert mock_bot.send_document.call_count == 3
-    sent_filenames = [call[1]["document"].filename for call in mock_bot.send_document.call_args_list]
-    assert any("9033807401" in fn for fn in sent_filenames)
-    assert any("9820192831" in fn for fn in sent_filenames)
-    assert any("combined" in fn or "batch" in fn for fn in sent_filenames)
-    # Strict rule: NO zip files
-    assert not any(fn.endswith(".zip") for fn in sent_filenames)
+    # Summary message delivered
+    assert mock_bot.send_message.called
+    msg_args = mock_bot.send_message.call_args[1]
+    assert msg_args["chat_id"] == user_id
+    assert "Token Refresh Completed" in msg_args["text"]
+    assert "saved directly inside bot database" in msg_args["text"]
+
+    # Strict: zero document exports to chat
+    assert mock_bot.send_document.call_count == 0
 
 
 @pytest.mark.asyncio

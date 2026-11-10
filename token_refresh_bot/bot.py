@@ -67,8 +67,9 @@ _bot_instance: Optional[Any] = None
 
 async def deliver_refreshed_batch_results(batch_id: str, batch_data: Optional[Dict[str, Any]] = None):
     """
-    Automatically delivers refreshed account JSON file(s) and completion summary
-    directly to the user upon batch completion.
+    Delivers refresh completion summary directly to the user upon batch completion.
+    All refreshed accounts are updated directly in the bot database.
+    Zero file spam: does NOT automatically export JSON files to chat.
     """
     global _bot_instance
     if not _bot_instance:
@@ -88,13 +89,11 @@ async def deliver_refreshed_batch_results(batch_id: str, batch_data: Optional[Di
     duplicate_count = batch_data.get("duplicate_count", 0)
     total_count = batch_data.get("total_count", 0)
 
-    # 1. Fetch refreshed accounts
-    refreshed_list = await BotStorage.get_refreshed_accounts_json(batch_id)
-
-    # 2. Build summary message text
+    # Build summary message text
     status_icon = "🎉" if success_count > 0 else "⚠️"
     summary_text = (
-        f"{status_icon} <b>Token Refresh Completed!</b>\n\n"
+        f"{status_icon} <b>Token Refresh Completed!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>Batch ID:</b> <code>{batch_id}</code>\n"
         f"<b>Total Accounts:</b> {total_count}\n"
         f"• Refreshed & Verified: <b>{success_count}</b> ✅\n"
@@ -108,134 +107,26 @@ async def deliver_refreshed_batch_results(batch_id: str, batch_data: Optional[Di
     if duplicate_count > 0:
         summary_text += f"• Duplicates Skipped: <b>{duplicate_count}</b> ⏭️\n"
 
-    summary_text += "\n<i>Here are your updated account JSON file(s):</i>"
+    summary_text += (
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💾 <b>All refreshed sessions saved directly inside bot database.</b>\n"
+        f"🔒 <i>Zero chat spam • No files sent to chat.</i>"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("📊 View Stored Accounts", callback_data="cmd:status")],
+        [InlineKeyboardButton("🔙 Main Menu", callback_data="cmd:start")]
+    ]
 
     try:
         await _bot_instance.send_message(
             chat_id=user_id,
             text=summary_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="HTML"
         )
     except Exception as e:
         logger.error(f"Failed to send completion summary message to user {user_id}: {e}")
-
-    # 3. Deliver Refreshed File(s) Automatically!
-    if refreshed_list:
-        BotConfig.ensure_directories()
-        num_accounts = len(refreshed_list)
-
-        # Single account: Deliver the individual refreshed JSON file directly
-        if num_accounts == 1:
-            acc = refreshed_list[0]
-            phone = acc.get("mobile") or acc.get("phone") or acc.get("user_id") or "account"
-            clean_phone = str(phone).replace("+", "").replace(" ", "").strip()
-            fname = f"account_{clean_phone}_refreshed.json"
-            fpath = BotConfig.SCRATCH_DIR / fname
-
-            with open(fpath, "w", encoding="utf-8") as f:
-                json.dump(acc, f, indent=2, ensure_ascii=False)
-
-            with open(fpath, "rb") as f:
-                try:
-                    await _bot_instance.send_document(
-                        chat_id=user_id,
-                        document=InputFile(f, filename=fname),
-                        caption=f"📄 <b>Refreshed Account JSON File</b>\n📱 Identifier: <code>{phone}</code>\nTokens updated and verified ✅",
-                        parse_mode="HTML"
-                    )
-                except Exception as e:
-                    logger.error(f"Error sending individual file for account {clean_phone}: {e}")
-
-        # Multiple accounts (2 to 5): Deliver each individual file separately (NO ZIP!) AND combined
-        elif num_accounts <= 5:
-            for idx, acc in enumerate(refreshed_list):
-                phone = acc.get("mobile") or acc.get("phone") or acc.get("user_id") or f"acc_{idx + 1}"
-                clean_phone = str(phone).replace("+", "").replace(" ", "").strip()
-                fname = f"account_{clean_phone}_refreshed.json"
-                fpath = BotConfig.SCRATCH_DIR / fname
-
-                with open(fpath, "w", encoding="utf-8") as f:
-                    json.dump(acc, f, indent=2, ensure_ascii=False)
-
-                with open(fpath, "rb") as f:
-                    try:
-                        await _bot_instance.send_document(
-                            chat_id=user_id,
-                            document=InputFile(f, filename=fname),
-                            caption=f"📄 Account <b>{idx + 1}/{num_accounts}</b>: <code>{phone}</code> (Refreshed)",
-                            parse_mode="HTML"
-                        )
-                    except Exception as e:
-                        logger.error(f"Error sending file {fname}: {e}")
-                await asyncio.sleep(0.15)
-
-            # Also deliver combined file for convenience
-            comb_path = BotConfig.EXPORTS_DIR / f"accounts_batch_{batch_id}_refreshed.json"
-            with open(comb_path, "w", encoding="utf-8") as f:
-                json.dump(refreshed_list, f, indent=2, ensure_ascii=False)
-
-            with open(comb_path, "rb") as f:
-                try:
-                    await _bot_instance.send_document(
-                        chat_id=user_id,
-                        document=InputFile(f, filename=comb_path.name),
-                        caption=f"📦 <b>Combined Refreshed Accounts JSON</b>\nTotal: <b>{num_accounts}</b> accounts",
-                        parse_mode="HTML"
-                    )
-                except Exception as e:
-                    logger.error(f"Error sending combined file: {e}")
-
-        # Larger batches (> 5 accounts): Deliver combined file and button to send all individual files
-        else:
-            comb_path = BotConfig.EXPORTS_DIR / f"accounts_batch_{batch_id}_refreshed.json"
-            with open(comb_path, "w", encoding="utf-8") as f:
-                json.dump(refreshed_list, f, indent=2, ensure_ascii=False)
-
-            keyboard = [
-                [InlineKeyboardButton("📄 Send All as Individual Files", callback_data=f"export:individual:{batch_id}")],
-                [InlineKeyboardButton("🔄 New Session", callback_data="cmd:refresh")]
-            ]
-
-            with open(comb_path, "rb") as f:
-                try:
-                    await _bot_instance.send_document(
-                        chat_id=user_id,
-                        document=InputFile(f, filename=comb_path.name),
-                        caption=f"📦 <b>Combined Refreshed Accounts JSON</b>\nTotal: <b>{num_accounts}</b> accounts verified ✅",
-                        reply_markup=InlineKeyboardMarkup(keyboard),
-                        parse_mode="HTML"
-                    )
-                except Exception as e:
-                    logger.error(f"Error sending large combined file: {e}")
-
-    # 4. If any accounts failed/expired/reauth, also deliver the failure report automatically!
-    if (failed_count > 0 or expired_count > 0 or reauth_count > 0):
-        failures = await BotStorage.get_failure_report(batch_id)
-        if failures:
-            fail_path = BotConfig.EXPORTS_DIR / f"failure_report_{batch_id}.json"
-            with open(fail_path, "w", encoding="utf-8") as f:
-                json.dump({
-                    "batch_id": batch_id,
-                    "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "total_failures": len(failures),
-                    "failures": failures
-                }, f, indent=2, ensure_ascii=False)
-
-            fail_keyboard = [
-                [InlineKeyboardButton("🔁 Retry Eligible Failed", callback_data=f"action:retry:{batch_id}")]
-            ]
-
-            with open(fail_path, "rb") as f:
-                try:
-                    await _bot_instance.send_document(
-                        chat_id=user_id,
-                        document=InputFile(f, filename=fail_path.name),
-                        caption=f"⚠️ <b>Failure & Attention Report</b>\nNon-Refreshed: <b>{len(failures)}</b> accounts",
-                        reply_markup=InlineKeyboardMarkup(fail_keyboard),
-                        parse_mode="HTML"
-                    )
-                except Exception as e:
-                    logger.error(f"Error sending failure report: {e}")
 
 
 def get_queue_manager() -> QueueManager:
@@ -1120,7 +1011,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"<b>Batch ID:</b> <code>{batch_id}</code>\n"
             f"<b>Accounts:</b> {len(accounts)}\n\n"
             f"⚡ Processing and verifying account tokens...\n"
-            f"📥 <i>Your refreshed account JSON file(s) will be automatically sent to you here upon completion!</i>",
+            f"💾 <i>All refreshed sessions will be updated directly in the bot database. No files sent to chat.</i>",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📊 View Live Status", callback_data="cmd:status")],
                 [InlineKeyboardButton("🔙 Main Menu", callback_data="cmd:start")]

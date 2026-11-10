@@ -346,3 +346,4 @@ class DirectDatabaseRefresher:
             [InlineKeyboardButton("🔙 Main Menu", callback_data="cmd:start")]
         ]
         return text, InlineKeyboardMarkup(keyboard)
+
