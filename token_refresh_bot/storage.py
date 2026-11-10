@@ -6,6 +6,7 @@ Uses aiosqlite with WAL mode and encrypted data-at-rest.
 
 import aiosqlite
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from config import BotConfig
@@ -300,3 +301,138 @@ class BotStorage:
             """) as cursor:
                 rows = await cursor.fetchall()
                 return [dict(r) for r in rows]
+
+    @classmethod
+    async def get_all_stored_accounts_for_refresh(cls) -> List[Dict[str, Any]]:
+        """
+        Retrieves all unique stored accounts in the bot database eligible for token refresh.
+        Deduplicates by account_identifier and selects the latest session record.
+        Never leaks raw tokens.
+        """
+        async with aiosqlite.connect(cls._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            query = """
+                SELECT a.*
+                FROM accounts a
+                INNER JOIN (
+                    SELECT account_identifier, MAX(rowid) as max_rowid
+                    FROM accounts
+                    GROUP BY account_identifier
+                ) latest ON a.rowid = latest.max_rowid
+                ORDER BY a.rowid ASC;
+            """
+            async with db.execute(query) as cursor:
+                rows = await cursor.fetchall()
+                candidates = []
+                for r in rows:
+                    identifier = r["account_identifier"]
+                    decrypted_json = None
+                    if r["encrypted_refreshed_json"]:
+                        decrypted_json = SecurityManager.decrypt_json(r["encrypted_refreshed_json"])
+                    if not decrypted_json and r["encrypted_original_json"]:
+                        decrypted_json = SecurityManager.decrypt_json(r["encrypted_original_json"])
+
+                    # Fallback check if export file exists for this mobile number
+                    if not decrypted_json:
+                        clean_id = re.sub(r"^\+?91|^0|\D", "", str(identifier))
+                        export_candidates = [
+                            BotConfig.SCRATCH_DIR / f"account_{clean_id}_refreshed.json",
+                            BotConfig.EXPORTS_DIR / f"account_{clean_id}.json",
+                        ]
+                        for exp_file in export_candidates:
+                            if exp_file.exists():
+                                try:
+                                    with open(exp_file, "r", encoding="utf-8") as f:
+                                        data = json.load(f)
+                                        if isinstance(data, dict) and (data.get("xo") or data.get("ox")):
+                                            decrypted_json = data
+                                            break
+                                except Exception:
+                                    pass
+
+                    if decrypted_json and isinstance(decrypted_json, dict):
+                        candidates.append({
+                            "record_id": r["id"],
+                            "batch_id": r["batch_id"],
+                            "account_identifier": identifier,
+                            "display_phone": r["display_phone"],
+                            "source_file": r["source_file"],
+                            "status": r["status"],
+                            "raw_session": decrypted_json,
+                            "updated_at": r["updated_at"]
+                        })
+                return candidates
+
+    @classmethod
+    async def update_account_session_in_place(
+        cls,
+        account_identifier: str,
+        record_id: str,
+        status: str,
+        refreshed_data: Optional[Dict[str, Any]] = None,
+        error_message: Optional[str] = None
+    ) -> bool:
+        """
+        Directly updates the stored account session in place inside the database.
+        - If SUCCESS, safely encrypts refreshed JSON and updates the record.
+        - If NOT SUCCESS, preserves original session data without clearing it.
+        - Never overwrites valid data with empty/invalid responses.
+        - Immediately commits the transaction.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(cls._db_path) as db:
+            if status == "SUCCESS" and refreshed_data and isinstance(refreshed_data, dict):
+                xo = refreshed_data.get("xo")
+                ox = refreshed_data.get("ox")
+                if not (xo and str(xo).strip()) and not (ox and str(ox).strip()):
+                    await db.execute("""
+                        UPDATE accounts
+                        SET status = 'FAILED',
+                            error_message = 'Refreshed payload contained empty tokens',
+                            updated_at = ?
+                        WHERE id = ? OR account_identifier = ?
+                    """, (now, record_id, account_identifier))
+                    await db.commit()
+                    return False
+
+                enc_refreshed = SecurityManager.encrypt_json(refreshed_data)
+                await db.execute("""
+                    UPDATE accounts
+                    SET encrypted_refreshed_json = ?,
+                        status = 'SUCCESS',
+                        error_message = NULL,
+                        updated_at = ?
+                    WHERE id = ? OR account_identifier = ?
+                """, (enc_refreshed, now, record_id, account_identifier))
+                await db.commit()
+                return True
+            else:
+                await db.execute("""
+                    UPDATE accounts
+                    SET status = ?,
+                        error_message = ?,
+                        updated_at = ?
+                    WHERE id = ? OR account_identifier = ?
+                """, (status, error_message, now, record_id, account_identifier))
+                await db.commit()
+                return False
+
+    @classmethod
+    async def get_database_account_stats(cls) -> Dict[str, Any]:
+        """Returns lifetime distinct account statistics in bot database."""
+        async with aiosqlite.connect(cls._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("""
+                SELECT 
+                    COUNT(DISTINCT account_identifier) as distinct_accounts,
+                    COUNT(*) as total_records,
+                    SUM(CASE WHEN status = 'SUCCESS' THEN 1 ELSE 0 END) as success_count,
+                    SUM(CASE WHEN status = 'EXPIRED' THEN 1 ELSE 0 END) as expired_count,
+                    SUM(CASE WHEN status NOT IN ('SUCCESS', 'EXPIRED') THEN 1 ELSE 0 END) as other_count
+                FROM accounts;
+            """) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else {
+                    "distinct_accounts": 0, "total_records": 0,
+                    "success_count": 0, "expired_count": 0, "other_count": 0
+                }

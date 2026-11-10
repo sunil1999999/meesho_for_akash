@@ -9,7 +9,8 @@ import pytest
 from provider import LiveHttpRefreshEngine, OutcomeStatus
 
 @pytest.mark.asyncio
-async def test_live_engine_fallback_and_validation():
+async def test_live_engine_fallback_and_validation(monkeypatch):
+    monkeypatch.setenv("USE_MOCK_PROVIDER", "true")
     engine = LiveHttpRefreshEngine()
 
     # 1. Missing tokens test

@@ -43,6 +43,7 @@ from storage import BotStorage
 from provider import LiveHttpRefreshEngine, MockRefreshEngine, BaseRefreshEngine
 from queue_manager import QueueManager
 from cleanup import clean_expired_temporary_files
+from direct_refresher import DirectDatabaseRefresher
 
 # Setup logging
 logging.basicConfig(
@@ -56,6 +57,9 @@ _user_staged_batches: Dict[int, Dict[str, Any]] = {}
 
 # Active QueueManager singleton
 _queue_manager: Optional[QueueManager] = None
+
+# Active in-place DirectDatabaseRefresher instance
+_active_direct_refresher: Optional[DirectDatabaseRefresher] = None
 
 # Reference to Telegram Bot instance for automatic file delivery
 _bot_instance: Optional[Any] = None
@@ -322,7 +326,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     keyboard = [
-        [InlineKeyboardButton("🔄 Start Refresh Session", callback_data="cmd:refresh")],
+        [InlineKeyboardButton("🔄 Refresh All JSON", callback_data="action:refresh_all_db")],
+        [InlineKeyboardButton("📁 Upload / Refresh Files", callback_data="cmd:refresh")],
         [
             InlineKeyboardButton("📊 Batch Status", callback_data="cmd:status"),
             InlineKeyboardButton("📁 View Results", callback_data="cmd:results")
@@ -360,7 +365,9 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"When ready, click <b>🚀 Start Refreshing</b> below to commence background queue processing."
     )
 
-    buttons = []
+    buttons = [
+        [InlineKeyboardButton("🔄 Refresh All JSON (Database)", callback_data="action:refresh_all_db")]
+    ]
     if account_count > 0:
         buttons.append([InlineKeyboardButton("🚀 Start Refreshing Queue", callback_data="action:process_queue")])
         buttons.append([InlineKeyboardButton("🗑️ Clear Staged Accounts", callback_data="action:clear_staged")])
@@ -373,6 +380,106 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
     elif update.message:
         await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+
+@check_auth
+async def refresh_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles /refresh_all: 1-click in-place refresh of all stored JSON sessions in database."""
+    await start_direct_refresh_flow(update, context)
+
+
+async def start_direct_refresh_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Core handler for 1-Click Refresh All JSON:
+    1. Retrieves all eligible unique accounts from SQLite database.
+    2. Runs parallel worker execution with bounded concurrency.
+    3. Throttles live progress updates on the exact same message.
+    4. Updates updated JSON sessions directly in database records in-place.
+    5. Displays final completion report with zero chat spam (no files sent to chat).
+    """
+    global _active_direct_refresher
+
+    # Prevent concurrent duplicate runs
+    if _active_direct_refresher and _active_direct_refresher.is_running:
+        text, kb = _active_direct_refresher.format_progress_text()
+        warning = "⚠️ <b>A Refresh All JSON task is already actively running!</b>\n\n" + text
+        if update.callback_query:
+            await update.callback_query.answer("Refresh All is already in progress!")
+            try:
+                await update.callback_query.edit_message_text(warning, reply_markup=kb, parse_mode="HTML")
+            except Exception:
+                pass
+        elif update.message:
+            await update.message.reply_text(warning, reply_markup=kb, parse_mode="HTML")
+        return
+
+    # Fetch stored database accounts
+    accounts = await BotStorage.get_all_stored_accounts_for_refresh()
+    if not accounts:
+        no_acct_text = (
+            "ℹ️ <b>No Stored JSON Sessions Found</b>\n\n"
+            "There are currently no saved account sessions in the bot database.\n"
+            "Please upload or paste your account JSON files first via /refresh or by sending a file to this chat."
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📁 Upload Accounts", callback_data="cmd:refresh")],
+            [InlineKeyboardButton("🔙 Main Menu", callback_data="cmd:start")]
+        ])
+        if update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text(no_acct_text, reply_markup=kb, parse_mode="HTML")
+        elif update.message:
+            await update.message.reply_text(no_acct_text, reply_markup=kb, parse_mode="HTML")
+        return
+
+    # Initialize DirectDatabaseRefresher with current engine
+    qm = get_queue_manager()
+    engine = qm.engine
+    refresher = DirectDatabaseRefresher(engine)
+    _active_direct_refresher = refresher
+
+    init_text, init_kb = refresher.format_progress_text()
+    status_msg = None
+    if update.callback_query:
+        await update.callback_query.answer("Starting One-Click Refresh All...")
+        try:
+            status_msg = await update.callback_query.edit_message_text(init_text, reply_markup=init_kb, parse_mode="HTML")
+        except Exception:
+            status_msg = update.callback_query.message
+    elif update.message:
+        status_msg = await update.message.reply_text(init_text, reply_markup=init_kb, parse_mode="HTML")
+
+    async def on_progress(ref: DirectDatabaseRefresher):
+        nonlocal status_msg
+        if not status_msg:
+            return
+        t, k = ref.format_progress_text() if ref.is_running else ref.format_completion_text()
+        try:
+            await status_msg.edit_text(t, reply_markup=k, parse_mode="HTML")
+        except telegram.error.BadRequest as b_err:
+            if "Message is not modified" in str(b_err):
+                pass
+            else:
+                logger.debug(f"Progress edit error: {b_err}")
+        except Exception as ex:
+            logger.debug(f"Progress edit transient error: {ex}")
+
+    refresher.set_progress_callback(on_progress)
+
+    async def _run_task():
+        try:
+            await refresher.run_refresh_all(accounts)
+        except Exception as err:
+            logger.error(f"Error during DirectDatabaseRefresher run: {err}", exc_info=True)
+        finally:
+            if status_msg:
+                final_text, final_kb = refresher.format_completion_text()
+                try:
+                    await status_msg.edit_text(final_text, reply_markup=final_kb, parse_mode="HTML")
+                except Exception:
+                    pass
+
+    asyncio.create_task(_run_task())
 
 
 @check_auth
@@ -946,6 +1053,47 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await admin_command(update, context)
         return
 
+    # Route: 1-Click Refresh All JSON Directly in Database
+    if data == "action:refresh_all_db":
+        await start_direct_refresh_flow(update, context)
+        return
+    elif data == "action:refresh_all_pause":
+        if _active_direct_refresher and _active_direct_refresher.is_running:
+            _active_direct_refresher.pause()
+            await query.answer("⏸️ Paused refresh workers.")
+            text, kb = _active_direct_refresher.format_progress_text()
+            try:
+                await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+            except Exception:
+                pass
+        else:
+            await query.answer("No active refresh to pause.")
+        return
+    elif data == "action:refresh_all_resume":
+        if _active_direct_refresher and _active_direct_refresher.is_running:
+            _active_direct_refresher.resume()
+            await query.answer("▶️ Resumed refresh workers.")
+            text, kb = _active_direct_refresher.format_progress_text()
+            try:
+                await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+            except Exception:
+                pass
+        else:
+            await query.answer("No active refresh to resume.")
+        return
+    elif data == "action:refresh_all_cancel":
+        if _active_direct_refresher and _active_direct_refresher.is_running:
+            _active_direct_refresher.cancel()
+            await query.answer("🛑 Cancelling refresh...")
+            text, kb = _active_direct_refresher.format_progress_text()
+            try:
+                await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+            except Exception:
+                pass
+        else:
+            await query.answer("No active refresh to cancel.")
+        return
+
     # Route: Process Staged Batch
     if data == "action:process_queue":
         staged = _user_staged_batches.get(user_id)
@@ -1195,6 +1343,7 @@ def create_bot_application() -> Application:
 
     # Commands
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("refresh_all", refresh_all_command))
     app.add_handler(CommandHandler("refresh", refresh_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("results", results_command))
